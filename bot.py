@@ -35,8 +35,15 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # ============================================================================
 # Configuración
@@ -101,7 +108,7 @@ DATOS: dict[int, dict] = {}
 
 
 def nuevo_lote() -> dict:
-    return {"total": 0, "listas": 0, "productos": 0, "fallidas": [], "aviso": "", "msg": None}
+    return {"total": 0, "listas": 0, "productos": 0, "fallidas": [], "aviso": "", "msg": None, "dias": []}
 
 
 def datos_chat(chat_id: int) -> dict:
@@ -111,6 +118,7 @@ def datos_chat(chat_id: int) -> dict:
             "procesando": 0,       # fotos en lectura
             "version": 0,
             "enviar_ya": False,    # el usuario pidió /excel mientras se leía
+            "dia": None,           # día elegido con /fecha (None = hoy)
             "base": None,          # bytes del último Excel
             "lote": nuevo_lote(),  # mensaje de estado del grupo de fotos actual
             "excel_lock": asyncio.Lock(),
@@ -126,6 +134,41 @@ def permitido(update: Update) -> bool:
 
 def hoy() -> date:
     return datetime.now(ZONA).date()
+
+
+DIAS_SEMANA = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+
+
+def dia_activo(d: dict) -> date:
+    return d["dia"] or hoy()
+
+
+def corto(dia: date) -> str:
+    return f"{DIAS_SEMANA[dia.weekday()]} {dia:%d/%m}"
+
+
+def leer_fecha_texto(texto: str) -> date | None:
+    """Entiende: hoy, ayer, anteayer, 10/11, 10-11-2026, 10/11/26."""
+    t = (texto or "").strip().lower()
+    base = hoy()
+    if t in ("hoy",):
+        return base
+    if t in ("ayer",):
+        return base.fromordinal(base.toordinal() - 1)
+    if t in ("anteayer", "antier"):
+        return base.fromordinal(base.toordinal() - 2)
+    m = re.search(r"\b(\d{1,2})[/\-.](\d{1,2})(?:[/\-.](\d{2,4}))?\b", t)
+    if not m:
+        return None
+    dd, mm, aa = int(m.group(1)), int(m.group(2)), m.group(3)
+    anio = int(aa) + (2000 if aa and len(aa) == 2 else 0) if aa else base.year
+    try:
+        f = date(anio, mm, dd)
+    except ValueError:
+        return None
+    if not aa and f > base:  # "28/12" escrito en enero = año pasado
+        f = date(anio - 1, mm, dd)
+    return f
 
 
 # ============================================================================
@@ -443,24 +486,17 @@ def escribir_hoja(ws, dia: date, filas: list[dict]) -> None:
     c_ln = c_l1 + len(NOMBRES_LUGARES) - 1
     c_tot = c_ln + 1
 
-    # Título
-    ws.merge_cells(f"A1:{ultima}1")
-    ws["A1"] = f"NOTAS DE EGRESO — registradas el {dia.strftime('%d/%m/%Y')}"
-    ws["A1"].font = Font(bold=True, size=13, color="1F4E78")
-    ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
-    ws.row_dimensions[1].height = 22
-
-    # Encabezados (fila 2)
+    # Encabezados (fila 1)
     for c, nombre in enumerate(ENCABEZADOS, start=1):
-        celda = ws.cell(2, c, nombre)
+        celda = ws.cell(1, c, nombre)
         celda.font = Font(bold=True, color="FFFFFF")
         celda.fill = AZUL
         celda.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         celda.border = BORDE
-    ws.row_dimensions[2].height = 30
+    ws.row_dimensions[1].height = 30
 
     # Datos
-    r = 3
+    r = 2
     for n, f in enumerate(filas, start=1):
         valores = [n, f["producto"], f["lote"], f["caducidad"], f["cantidad"]] + list(f["reparto"])
         for c, v in enumerate(valores, start=1):
@@ -474,47 +510,31 @@ def escribir_hoja(ws, dia: date, filas: list[dict]) -> None:
                 vertical="center", wrap_text=(c == 2),
                 horizontal="left" if c in (2, 3) else "center",
             )
+        ws.cell(r, c_tot).font = Font(bold=True)
         ws.cell(r, 3).number_format = "@"
         if isinstance(f["caducidad"], date):
             ws.cell(r, 4).number_format = "DD/MM/YYYY"
         r += 1
-
-    # Totales
     fin = r - 1
-    ws.cell(r, 2, "TOTAL")
-    for c in [c_cant] + list(range(c_l1, c_tot + 1)):
-        col = get_column_letter(c)
-        ws.cell(r, c, f"=SUM({col}3:{col}{fin})" if fin >= 3 else 0)
-    for c in range(1, n_cols + 1):
-        celda = ws.cell(r, c)
-        celda.font = Font(bold=True)
-        celda.fill = GRIS
-        celda.border = BORDE
-        celda.alignment = Alignment(horizontal="center", vertical="center")
 
     # Si "Total repartido" no coincide con "Cantidad", la celda se pinta de rojo
-    if fin >= 3:
-        rango = f"{get_column_letter(c_tot)}3:{get_column_letter(c_tot)}{fin}"
+    if fin >= 2:
+        col_t, col_c = get_column_letter(c_tot), get_column_letter(c_cant)
         ws.conditional_formatting.add(
-            rango,
-            FormulaRule(
-                formula=[f"${get_column_letter(c_tot)}3<>${get_column_letter(c_cant)}3"],
-                fill=ROJO,
-            ),
+            f"{col_t}2:{col_t}{fin}", FormulaRule(formula=[f"${col_t}2<>${col_c}2"], fill=ROJO)
         )
 
-    # Anchos
-    anchos = {1: 5, 2: 60, 3: 16, 4: 12, 5: 10}
+    # Anchos y vista
+    anchos = {1: 5, 2: 60, 3: 16, 4: 12, 5: 10, n_cols: 16}
     for c in range(1, n_cols + 1):
-        ancho = anchos.get(c, max(10, len(ENCABEZADOS[c - 1]) + 2))
-        ws.column_dimensions[get_column_letter(c)].width = ancho
-    ws.freeze_panes = "C3"
-    ws.auto_filter.ref = f"A2:{ultima}{max(fin, 2)}"
+        ws.column_dimensions[get_column_letter(c)].width = anchos.get(c, max(10, len(ENCABEZADOS[c - 1]) + 2))
+    ws.freeze_panes = "C2"
+    ws.auto_filter.ref = f"A1:{ultima}{max(fin, 1)}"
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
-    ws.print_title_rows = "2:2"
+    ws.print_title_rows = "1:1"
 
 
 def agregar_al_excel(base: bytes | None, dia: date, nuevos: list[dict]) -> tuple[bytes, int]:
@@ -568,6 +588,8 @@ def texto_estado(lote: dict, d: dict) -> str:
         txt = f"✅ {t} foto{'s' if t != 1 else ''} · {lote['productos']} productos"
         if d["pendientes"]:
             txt += "\n📊 Preparando Excel…"
+    if lote["dias"]:
+        txt += "\n📅 Hoja: " + ", ".join(nombre_hoja(x) for x in lote["dias"])
     if lote["fallidas"]:
         for n, motivo in lote["fallidas"]:
             txt += f"\n⚠️ Foto {n} no leída ({motivo}). Reenvíala."
@@ -623,10 +645,14 @@ async def generar_y_enviar(bot, chat_id: int) -> None:
         if not d["pendientes"]:
             return
         nuevos = sorted(d["pendientes"], key=lambda p: p["orden"])
-        dia = hoy()
-        excel, total_dia = agregar_al_excel(await obtener_base(bot, chat_id, d), dia, nuevos)
+        excel = await obtener_base(bot, chat_id, d)
+        lineas = []
+        for dia in sorted({p["dia"] for p in nuevos}):
+            del_dia = [p for p in nuevos if p["dia"] == dia]
+            excel, total_dia = agregar_al_excel(excel, dia, del_dia)
+            lineas.append(f"📅 {nombre_hoja(dia)} · +{len(del_dia)} productos ({total_dia} en el día)")
+        caption = "\n".join(lineas)
         dudosos = sum("(?)" in (p["producto"] + p["lote"]) or p["cantidad"] is None for p in nuevos)
-        caption = f"📅 {nombre_hoja(dia)} · +{len(nuevos)} productos ({total_dia} en el día)"
         if dudosos:
             caption += f"\n🔎 {dudosos} fila(s) marcadas con (?) para revisar"
         msg = await bot.send_document(chat_id, io.BytesIO(excel), filename=NOMBRE_EXCEL, caption=caption)
@@ -666,7 +692,11 @@ AYUDA = (
     "📷 Mándame las fotos de las notas de egreso.\n"
     "📊 Te devuelvo el Excel: una hoja por día y el reparto por lugar.\n"
     "📌 El Excel queda fijado arriba; cada día se agrega una hoja.\n\n"
-    "/excel – recibirlo ya\n"
+    "📅 Las fotos van al día de HOY. Para otro día, escribe la fecha "
+    "(ej. «ayer» o «10/11») o usa /fecha, y luego manda las fotos.\n\n"
+    "/fecha – elegir el día\n"
+    "/hoy – volver a hoy\n"
+    "/excel – recibir el Excel ya\n"
     "/nuevo – descartar lo leído sin guardar"
 )
 
@@ -713,6 +743,70 @@ async def cmd_lugares(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+def teclado_fechas() -> InlineKeyboardMarkup:
+    base = hoy()
+    dias = [base.fromordinal(base.toordinal() - i) for i in range(8)]
+    botones = [
+        InlineKeyboardButton(("Hoy · " if i == 0 else "Ayer · " if i == 1 else "") + corto(x),
+                             callback_data=f"dia:{x.isoformat()}")
+        for i, x in enumerate(dias)
+    ]
+    return InlineKeyboardMarkup([botones[i : i + 2] for i in range(0, len(botones), 2)])
+
+
+def texto_dia_elegido(dia: date) -> str:
+    if dia == hoy():
+        return f"📅 Listo: las fotos van a HOY ({nombre_hoja(dia)})."
+    return f"📅 Listo: las próximas fotos van a la hoja {nombre_hoja(dia)} ({corto(dia)}).\n/hoy para volver a hoy."
+
+
+def elegir_dia(d: dict, dia: date) -> None:
+    d["dia"] = None if dia == hoy() else dia
+
+
+async def cmd_fecha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not permitido(update):
+        return
+    d = datos_chat(update.effective_chat.id)
+    if context.args:
+        dia = leer_fecha_texto(" ".join(context.args))
+        if dia:
+            elegir_dia(d, dia)
+            await update.message.reply_text(texto_dia_elegido(dia))
+            return
+    await update.message.reply_text(
+        f"¿De qué día son las fotos? (ahora: {nombre_hoja(dia_activo(d))})", reply_markup=teclado_fechas()
+    )
+
+
+async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not permitido(update):
+        return
+    d = datos_chat(update.effective_chat.id)
+    d["dia"] = None
+    await update.message.reply_text(texto_dia_elegido(hoy()))
+
+
+async def boton_fecha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not permitido(update):
+        return
+    dia = date.fromisoformat(q.data.split(":", 1)[1])
+    elegir_dia(datos_chat(update.effective_chat.id), dia)
+    await q.edit_message_text(texto_dia_elegido(dia))
+
+
+async def recibir_texto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Si escriben una fecha ("ayer", "10/11") cambia el día; si no, muestra la ayuda."""
+    dia = leer_fecha_texto(update.message.text) if permitido(update) else None
+    if dia and len(update.message.text) <= 20:
+        elegir_dia(datos_chat(update.effective_chat.id), dia)
+        await update.message.reply_text(texto_dia_elegido(dia))
+    else:
+        await cmd_start(update, context)
+
+
 async def recibir_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not permitido(update):
         await update.message.reply_text("No tienes permiso para usar este bot.")
@@ -721,9 +815,15 @@ async def recibir_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
     bot = context.bot
     d = datos_chat(chat_id)
+    pie = leer_fecha_texto(msg.caption) if msg.caption else None
+    if pie:  # fecha escrita en el pie de la foto: cambia el día
+        elegir_dia(d, pie)
+    dia = dia_activo(d)
     d["version"] += 1
     d["procesando"] += 1
     lote = d["lote"]
+    if dia not in lote["dias"]:
+        lote["dias"].append(dia)
     lote["total"] += 1
     numero = lote["total"]
     await mostrar_estado(bot, chat_id, d)
@@ -744,6 +844,7 @@ async def recibir_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         for i, p in enumerate(productos):
             p["imagen"] = etiqueta
             p["orden"] = (msg.message_id, i)
+            p["dia"] = dia
         d["pendientes"].extend(productos)
         lote["productos"] += len(productos)
     except Exception as e:  # noqa: BLE001
@@ -796,9 +897,12 @@ def main() -> None:
     app.add_handler(CommandHandler("excel", cmd_excel))
     app.add_handler(CommandHandler(["nuevo", "borrar"], cmd_nuevo))
     app.add_handler(CommandHandler("lugares", cmd_lugares))
+    app.add_handler(CommandHandler("fecha", cmd_fecha))
+    app.add_handler(CommandHandler("hoy", cmd_hoy))
+    app.add_handler(CallbackQueryHandler(boton_fecha, pattern=r"^dia:"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, recibir_imagen))
     app.add_handler(MessageHandler(filters.Document.FileExtension("xlsx"), recibir_excel))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_texto))
     app.add_error_handler(manejar_error)
 
     if URL_PUBLICA:
