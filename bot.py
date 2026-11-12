@@ -124,6 +124,7 @@ def datos_chat(chat_id: int) -> dict:
         DATOS[chat_id] = {
             "pendientes": [],  # productos leídos que aún no están en el Excel
             "imagenes": 0,
+            "recibidas": 0,
             "procesando": 0,
             "version": 0,
             "base": None,  # bytes del último Excel conocido
@@ -208,7 +209,9 @@ async def comprobar_gemini() -> str:
         return f"la clave NO funcionó -> {ultimo}"
 
 
-async def llamar_gemini(imagen: bytes, mime: str) -> dict:
+async def llamar_gemini(imagen: bytes, mime: str, avisar=None) -> dict:
+    """Lee la imagen con Gemini. `avisar` es una función opcional para informar
+    al usuario si Gemini está ocupado. Nunca tarda más de ~3 minutos en total."""
     cuerpo = {
         "contents": [
             {
@@ -220,56 +223,77 @@ async def llamar_gemini(imagen: bytes, mime: str) -> dict:
         ],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
     }
+    loop = asyncio.get_running_loop()
+    limite = loop.time() + 180
     ultimo_error = "sin respuesta"
-    async with httpx.AsyncClient(timeout=180) as cli:
+
+    async def decir(texto):
+        if avisar:
+            try:
+                await avisar(texto)
+            except Exception:  # noqa: BLE001
+                pass
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20)) as cli:
         for modelo in MODELOS:
-            intento = 0
-            while intento < 3:
-                intento += 1
-                auth_ok = False
+            for intento in range(1, 3):
+                if loop.time() > limite:
+                    raise RuntimeError(f"Gemini tardó demasiado ({ultimo_error})")
+                r = None
+                modo_usado = None
                 for modo in _modos_a_probar():
                     h, q = _auth(modo)
+                    inicio = loop.time()
                     try:
                         r = await cli.post(
                             f"{GEMINI_URL}/models/{modelo}:generateContent",
                             headers=h, params=q, json=cuerpo,
                         )
                     except httpx.HTTPError as e:
-                        ultimo_error = f"conexión: {e}"
+                        ultimo_error = f"conexión: {type(e).__name__} {e}"
+                        log.warning("Gemini %s: %s", modelo, ultimo_error)
+                        r = None
                         break
+                    log.info("Gemini %s [%s] -> %s en %.1fs", modelo, modo, r.status_code, loop.time() - inicio)
                     if _es_error_auth(r) and not _modo_auth["actual"]:
-                        ultimo_error = f"{r.status_code} {r.text[:200]}"
-                        continue  # prueba otra forma de enviar la clave
-                    auth_ok = True
+                        ultimo_error = f"{r.status_code} {r.text[:300]}"
+                        log.warning("Clave rechazada en modo %s: %s", modo, ultimo_error)
+                        r = None
+                        continue
+                    modo_usado = modo
                     break
                 else:
                     raise RuntimeError(f"La clave de Gemini no fue aceptada ({ultimo_error})")
-                if not auth_ok:
+                if r is None:
                     await asyncio.sleep(3)
                     continue
 
                 if r.status_code == 200:
-                    _modo_auth["actual"] = _modo_auth["actual"] or modo
-                    datos = r.json()
+                    _modo_auth["actual"] = _modo_auth["actual"] or modo_usado
                     try:
-                        partes = datos["candidates"][0]["content"]["parts"]
+                        partes = r.json()["candidates"][0]["content"]["parts"]
                         texto = "".join(p.get("text", "") for p in partes if not p.get("thought"))
                         return interpretar_json(texto)
-                    except (KeyError, IndexError, json.JSONDecodeError) as e:
-                        ultimo_error = f"respuesta rara: {e}"
-                        await asyncio.sleep(2)
+                    except (KeyError, IndexError, ValueError) as e:
+                        ultimo_error = f"respuesta rara: {e} {r.text[:300]}"
+                        log.warning(ultimo_error)
                         continue
-                ultimo_error = f"{r.status_code} {r.text[:200]}"
-                if r.status_code in (429, 500, 503):
-                    espera = 20 * intento
-                    log.warning("Gemini ocupado/límite (%s). Espero %ss", r.status_code, espera)
-                    await asyncio.sleep(espera)
+
+                ultimo_error = f"{r.status_code} {r.text[:300]}"
+                log.warning("Gemini %s error: %s", modelo, ultimo_error)
+                if r.status_code == 429:
+                    sin_cuota = "limit: 0" in r.text or "PerDay" in r.text or "per day" in r.text.lower()
+                    if sin_cuota or intento == 2:
+                        await decir(f"⏳ Gemini sin cupo en {modelo}, pruebo otro modelo...")
+                        break
+                    await decir("⏳ Gemini está con mucha demanda, reintento en 15 s...")
+                    await asyncio.sleep(15)
                     continue
-                if r.status_code == 404:
-                    log.warning("Modelo %s no disponible, pruebo otro", modelo)
-                    break
-                log.warning("Error Gemini %s", ultimo_error)
-                break
+                if r.status_code in (500, 502, 503, 504):
+                    await decir("⏳ Gemini está ocupado, reintento en 10 s...")
+                    await asyncio.sleep(10)
+                    continue
+                break  # 400/403/404 u otro: probar el siguiente modelo
     raise RuntimeError(ultimo_error)
 
 
@@ -564,6 +588,8 @@ async def generar_y_enviar(bot, chat_id: int, automatico: bool = False) -> None:
         d["base"] = excel
         d["pendientes"] = []
         d["imagenes"] = 0
+        if not d["procesando"]:
+            d["recibidas"] = 0
         try:
             await bot.unpin_all_chat_messages(chat_id)
             await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
@@ -612,6 +638,7 @@ async def cmd_ver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     d = datos_chat(update.effective_chat.id)
     await update.message.reply_text(
+        f"Fotos leyéndose ahora: {d['procesando']}\n"
         f"Fotos leídas (aún sin Excel): {d['imagenes']}\n"
         f"Productos pendientes: {len(d['pendientes'])}\n"
         f"Hoja de hoy: {nombre_hoja(hoy())}"
@@ -636,6 +663,8 @@ async def cmd_nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     d = datos_chat(update.effective_chat.id)
     d["pendientes"], d["imagenes"] = [], 0
+    if not d["procesando"]:
+        d["recibidas"] = 0
     d["version"] += 1
     await update.message.reply_text("🗑 Descarté lo leído. El Excel fijado no cambió.")
 
@@ -646,6 +675,12 @@ async def cmd_excel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     d = datos_chat(chat_id)
     d["version"] += 1  # cancela el envío automático pendiente
+    if d["procesando"]:
+        await update.message.reply_text(
+            f"⏳ Todavía estoy leyendo {d['procesando']} foto(s). Te mando el Excel apenas termine."
+        )
+        while d["procesando"]:
+            await asyncio.sleep(2)
     if d["pendientes"]:
         await generar_y_enviar(context.bot, chat_id)
         return
@@ -659,6 +694,9 @@ async def cmd_excel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Todavía no hay registros. Mándame las fotos 📷")
 
 
+LECTURA: dict[int, asyncio.Lock] = {}
+
+
 async def recibir_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not permitido(update):
         await update.message.reply_text("No tienes permiso para usar este bot.")
@@ -668,21 +706,34 @@ async def recibir_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     d = datos_chat(chat_id)
     d["version"] += 1
     d["procesando"] += 1
-    numero = d["imagenes"] + 1
-    aviso = await msg.reply_text(f"⏳ Leyendo foto {numero}...")
+    d["recibidas"] = d.get("recibidas", 0) + 1
+    numero = d["recibidas"]
+    en_cola = d["procesando"] > 1
+    aviso = await msg.reply_text(
+        f"🕐 Foto {numero} en cola..." if en_cola else f"⏳ Leyendo foto {numero}..."
+    )
+
+    async def avisar(texto):
+        await aviso.edit_text(f"Foto {numero}: {texto}")
+
     try:
-        if msg.photo:
-            archivo = await msg.photo[-1].get_file()
-            mime = "image/jpeg"
-        else:
-            archivo = await msg.document.get_file()
-            mime = msg.document.mime_type or "image/jpeg"
-        imagen = bytes(await archivo.download_as_bytearray())
-        productos = limpiar_productos(await llamar_gemini(imagen, mime))
+        # Las fotos se leen de una en una (para no saturar la cuota gratis de Gemini),
+        # pero el bot sigue respondiendo comandos mientras tanto.
+        async with LECTURA.setdefault(chat_id, asyncio.Lock()):
+            if en_cola:
+                await aviso.edit_text(f"⏳ Leyendo foto {numero}...")
+            if msg.photo:
+                archivo = await msg.photo[-1].get_file()
+                mime = "image/jpeg"
+            else:
+                archivo = await msg.document.get_file()
+                mime = msg.document.mime_type or "image/jpeg"
+            imagen = bytes(await archivo.download_as_bytearray())
+            productos = limpiar_productos(await llamar_gemini(imagen, mime, avisar))
         if not productos:
-            await aviso.edit_text("🤔 No encontré productos en esa foto. ¿Es una nota de egreso?")
+            await aviso.edit_text(f"🤔 Foto {numero}: no encontré productos. ¿Es una nota de egreso?")
         else:
-            d["imagenes"] = numero
+            d["imagenes"] += 1
             etiqueta = f"Foto {numero} ({datetime.now(ZONA):%H:%M})"
             for p in productos:
                 p["imagen"] = etiqueta
@@ -696,14 +747,13 @@ async def recibir_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 extra += f"\n⚠️ {sin_cant} producto(s) sin cantidad legible."
             await aviso.edit_text(
                 f"✅ Foto {numero}: {len(productos)} producto(s). "
-                f"Llevo {len(d['pendientes'])}.{extra}\n"
-                "Manda más fotos o escribe /excel"
+                f"Llevo {len(d['pendientes'])}.{extra}"
             )
     except Exception as e:  # noqa: BLE001
         log.exception("Error leyendo imagen")
         await aviso.edit_text(
-            "⚠️ No pude leer esa foto. Prueba de nuevo en un minuto o con una foto más clara."
-            f"\n({str(e)[:180]})"
+            f"⚠️ No pude leer la foto {numero}. Vuelve a enviarla en unos minutos."
+            f"\n({str(e)[:200]})"
         )
     finally:
         d["procesando"] -= 1
@@ -746,7 +796,13 @@ def main() -> None:
     if not GEMINI_API_KEY:
         raise SystemExit("Falta la variable GEMINI_API_KEY")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(al_iniciar).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .concurrent_updates(True)  # responde comandos aunque esté leyendo fotos
+        .post_init(al_iniciar)
+        .build()
+    )
     app.add_handler(CommandHandler(["start", "ayuda", "help"], cmd_start))
     app.add_handler(CommandHandler("excel", cmd_excel))
     app.add_handler(CommandHandler("ver", cmd_ver))
