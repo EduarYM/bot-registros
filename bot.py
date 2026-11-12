@@ -143,14 +143,14 @@ Transcribe TODAS las filas de productos. Responde SOLO este JSON:
 
 _modo_auth = {"actual": None}
 MODOS_AUTH = ["header", "query", "bearer"]
-SIN_THINKING_CFG: set[str] = set()  # modelos que no aceptan configurar el "razonamiento"
+MODO_SIMPLE: set[str] = set()  # modelos que no aceptan las opciones extra (esquema / razonamiento)
 _cliente: httpx.AsyncClient | None = None
 
 
 def cliente() -> httpx.AsyncClient:
     global _cliente
     if _cliente is None:
-        _cliente = httpx.AsyncClient(timeout=httpx.Timeout(90, connect=15))
+        _cliente = httpx.AsyncClient(timeout=httpx.Timeout(150, connect=15))
     return _cliente
 
 
@@ -184,14 +184,36 @@ async def comprobar_gemini() -> str:
     return f"la clave NO funcionó -> {ultimo}"
 
 
+ESQUEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "productos": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "producto": {"type": "STRING"},
+                    "lote": {"type": "STRING"},
+                    "caducidad": {"type": "STRING"},
+                    "cantidad": {"type": "INTEGER"},
+                },
+                "required": ["producto", "lote", "caducidad", "cantidad"],
+            },
+        }
+    },
+    "required": ["productos"],
+}
+
+
 def _config(modelo: str) -> dict:
-    """Respuesta en JSON y SIN razonamiento largo: es lo que más acelera la lectura."""
+    """JSON con formato fijo y razonamiento bajo: más rápido y sin respuestas raras."""
     cfg = {"responseMimeType": "application/json", "temperature": 0}
-    if modelo not in SIN_THINKING_CFG:
+    if modelo not in MODO_SIMPLE:
+        cfg["responseSchema"] = ESQUEMA
         if "2.5" in modelo:
             cfg["thinkingConfig"] = {"thinkingBudget": 0}
         else:
-            cfg["thinkingConfig"] = {"thinkingLevel": "minimal"}
+            cfg["thinkingConfig"] = {"thinkingLevel": "low"}
     return cfg
 
 
@@ -201,7 +223,7 @@ async def llamar_gemini(imagen: bytes, mime: str, avisar=None) -> dict:
         {"text": PROMPT},
     ]
     loop = asyncio.get_running_loop()
-    limite = loop.time() + 150
+    limite = loop.time() + 280
     ultimo_error = "sin respuesta"
     modos = [_modo_auth["actual"]] if _modo_auth["actual"] else MODOS_AUTH
 
@@ -218,6 +240,11 @@ async def llamar_gemini(imagen: bytes, mime: str, avisar=None) -> dict:
                     r = await cliente().post(
                         f"{GEMINI_URL}/models/{modelo}:generateContent", headers=h, params=q, json=cuerpo
                     )
+                except httpx.TimeoutException:
+                    ultimo_error = "Gemini tardó demasiado"
+                    log.warning("Gemini %s: timeout tras %.0fs", modelo, loop.time() - t0)
+                    r = "timeout"
+                    break
                 except httpx.HTTPError as e:
                     ultimo_error = f"conexión: {type(e).__name__}"
                     r = None
@@ -230,22 +257,26 @@ async def llamar_gemini(imagen: bytes, mime: str, avisar=None) -> dict:
                 if r.status_code == 200 and not _modo_auth["actual"]:
                     _modo_auth["actual"] = modo
                 break
+            if r == "timeout":
+                break  # modelo lento: pruebo el siguiente
             if r is None:
                 await asyncio.sleep(2)
                 continue
 
             if r.status_code == 200:
                 try:
-                    p = r.json()["candidates"][0]["content"]["parts"]
+                    cand = r.json()["candidates"][0]
+                    p = cand["content"]["parts"]
                     return interpretar_json("".join(x.get("text", "") for x in p if not x.get("thought")))
                 except (KeyError, IndexError, ValueError) as e:
-                    ultimo_error = f"respuesta incompleta ({e})"
+                    ultimo_error = f"respuesta incompleta ({type(e).__name__})"
+                    log.warning("Gemini %s respuesta rara: %s", modelo, r.text[:500])
                     continue
 
             ultimo_error = f"{r.status_code} {r.text[:300]}"
             log.warning("Gemini %s: %s", modelo, ultimo_error)
-            if r.status_code == 400 and "thinking" in r.text.lower() and modelo not in SIN_THINKING_CFG:
-                SIN_THINKING_CFG.add(modelo)  # este modelo no acepta esa opción: reintento sin ella
+            if r.status_code == 400 and modelo not in MODO_SIMPLE:
+                MODO_SIMPLE.add(modelo)  # no acepta las opciones extra: reintento sin ellas
                 intento -= 1
                 continue
             if r.status_code == 429:
@@ -309,7 +340,15 @@ def a_entero(valor):
 
 def limpiar_productos(resultado: dict) -> list[dict]:
     salida = []
-    for p in resultado.get("productos", []) or []:
+    if isinstance(resultado, list):
+        lista = resultado
+    elif isinstance(resultado, dict):
+        lista = resultado.get("productos")
+        if lista is None:  # otra clave: toma la primera lista que encuentre
+            lista = next((v for v in resultado.values() if isinstance(v, list)), [])
+    else:
+        lista = []
+    for p in lista or []:
         if not isinstance(p, dict):
             continue
         producto = str(p.get("producto") or "").strip()
@@ -530,9 +569,22 @@ def texto_estado(lote: dict, d: dict) -> str:
         if d["pendientes"]:
             txt += "\n📊 Preparando Excel…"
     if lote["fallidas"]:
-        nums = ", ".join(str(n) for n in lote["fallidas"])
-        txt += f"\n⚠️ No pude leer la foto {nums}. Reenvíala."
+        for n, motivo in lote["fallidas"]:
+            txt += f"\n⚠️ Foto {n} no leída ({motivo}). Reenvíala."
     return txt
+
+
+def motivo_corto(e: Exception) -> str:
+    t = str(e)
+    if "sin productos" in t:
+        return "no encontré productos"
+    if "tardó" in t:
+        return "Gemini tardó demasiado"
+    if t.startswith("429"):
+        return "cupo de Gemini agotado, espera unos minutos"
+    if t[:3].isdigit():
+        return f"error {t[:3]} de Gemini"
+    return t[:60] or type(e).__name__
 
 
 async def mostrar_estado(bot, chat_id: int, d: dict) -> None:
@@ -696,7 +748,7 @@ async def recibir_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         lote["productos"] += len(productos)
     except Exception as e:  # noqa: BLE001
         log.warning("Foto %s no leída: %s", numero, e)
-        lote["fallidas"].append(numero)
+        lote["fallidas"].append((numero, motivo_corto(e)))
     finally:
         lote["listas"] += 1
         lote["aviso"] = ""
